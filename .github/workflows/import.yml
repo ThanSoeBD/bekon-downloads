@@ -102,28 +102,24 @@ jobs:
           No GitHub account is required. SHA256SUMS contains installer checksums.
           EOF
           
-          # Read the tag explicitly so an authentication/network error cannot be mistaken
-          # for a missing release. Only HTTP 404 allows creation of a new draft.
+          # GitHub's tag endpoint cannot find a draft before its tag exists. Listing
+          # authenticated releases includes drafts and also preserves API failures.
           release_json="$asset_directory/public-release.json"
-          release_error="$asset_directory/public-release-error.txt"
-          if gh api "repos/$public_repo/releases/tags/$release_tag" > "$release_json" 2> "$release_error"; then
-            if [[ "$(jq -r .draft "$release_json")" != true ]]; then
-              # A retried job can succeed only if the public installers match byte-for-byte.
-              while read -r digest asset; do
-                jq -e --arg name "$asset" --arg digest "sha256:$digest" \
-                  '.assets | any(.name == $name and .digest == $digest)' \
-                  "$release_json" > /dev/null
-              done < "$asset_directory/SHA256SUMS"
-              echo "Public release $release_tag already contains these installers."
-              exit 0
-            fi
-          elif grep -q 'HTTP 404' "$release_error"; then
+          gh api --paginate --slurp "repos/$public_repo/releases?per_page=100" | \
+            jq --arg tag "$release_tag" '[.[][] | select(.tag_name == $tag)][0] // null' > "$release_json"
+          if [[ "$(jq -r '. == null' "$release_json")" == true ]]; then
             gh release create "$release_tag" --repo "$public_repo" --draft \
               --title "Bekon VMS Desktop $version" \
               --notes-file "$asset_directory/RELEASE-NOTES.md"
-          else
-            cat "$release_error" >&2
-            exit 1
+          elif [[ "$(jq -r .draft "$release_json")" != true ]]; then
+            # A retried job can succeed only if the public installers match byte-for-byte.
+            while read -r digest asset; do
+              jq -e --arg name "$asset" --arg digest "sha256:$digest" \
+                '.assets | any(.name == $name and .digest == $digest)' \
+                "$release_json" > /dev/null
+            done < "$asset_directory/SHA256SUMS"
+            echo "Public release $release_tag already contains these installers."
+            exit 0
           fi
           
           upload_files=()
@@ -131,7 +127,7 @@ jobs:
             upload_files+=("$asset_directory/$asset")
           done
           gh release upload "$release_tag" "${upload_files[@]}" --repo "$public_repo" --clobber
-          gh api "repos/$public_repo/releases/tags/$release_tag" > "$release_json"
+          gh release view "$release_tag" --repo "$public_repo" --json assets > "$release_json"
           while read -r digest asset; do
             jq -e --arg name "$asset" --arg digest "sha256:$digest" \
               '.assets | any(.name == $name and .digest == $digest)' \
