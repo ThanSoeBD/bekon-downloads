@@ -18,4 +18,4 @@ Official desktop installers for Bekon VMS. Downloads do not require a GitHub acc
 
 Contact your Bekon administrator for account access or installation support.
 
-This repository distributes installers and release information. It does not contain the application's source code. GitHub's automatically generated source archives contain only this repository's documentation.
+This repository distributes installers and release information. It does not contain the application's source code. GitHub's automatically generated source archives contain this repository's documentation and installer publication workflow, not the application's source code.
