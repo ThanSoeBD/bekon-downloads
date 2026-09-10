@@ -1,0 +1,146 @@
+name: Import installer release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Stable version tag (vms-desktop-vX.Y.Z)
+        required: true
+        type: string
+      manifest:
+        description: JSON installer URLs, sizes, and SHA-256 checksums
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: import-${{ inputs.tag }}
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Download and verify installer allowlist
+        env:
+          MANIFEST: ${{ inputs.manifest }}
+        shell: python
+        run: |
+          import hashlib, json, os, pathlib, re, urllib.request, urllib.parse
+          expected = {"Bekon-VMS-Desktop-macOS.dmg", "Bekon-VMS-Desktop-Windows.exe", "Bekon-VMS-Desktop-Linux.AppImage"}
+          manifest = json.loads(os.environ["MANIFEST"])
+          assert len(manifest) == 3 and {a["name"] for a in manifest} == expected
+          directory = pathlib.Path("release-assets")
+          directory.mkdir()
+          for asset in manifest:
+              url = asset["url"]
+              parsed = urllib.parse.urlparse(url)
+              assert parsed.scheme == "https" and parsed.hostname == "release-assets.githubusercontent.com"
+              assert not parsed.username and not parsed.password and parsed.port in (None, 443)
+              assert re.fullmatch(r"[0-9a-f]{64}", asset["sha256"])
+              assert isinstance(asset["size"], int) and 0 < asset["size"] < 2_000_000_000
+              print("::add-mask::" + url, flush=True)
+              digest = hashlib.sha256()
+              size = 0
+              with urllib.request.urlopen(url, timeout=60) as response, directory.joinpath(asset["name"]).open("wb") as output:
+                  while chunk := response.read(1024 * 1024):
+                      size += len(chunk)
+                      assert size <= asset["size"], "Unexpected installer size"
+                      digest.update(chunk)
+                      output.write(chunk)
+              assert size == asset["size"] and digest.hexdigest() == asset["sha256"], "Installer checksum mismatch"
+              print("Verified " + asset["name"], flush=True)
+      - name: Publish verified installers
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+        shell: bash
+        run: |
+          #!/usr/bin/env bash
+          # Publish only the installer allowlist; never check out source into the public repo.
+          set -euo pipefail
+          
+          release_tag="$RELEASE_TAG"
+          asset_directory="release-assets"
+          public_repo="ThanSoeBD/bekon-downloads"
+          
+          if [[ ! "$release_tag" =~ ^vms-desktop-v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Expected a stable release tag such as vms-desktop-v0.6.9." >&2
+            exit 1
+          fi
+          
+          assets=(
+            Bekon-VMS-Desktop-macOS.dmg
+            Bekon-VMS-Desktop-Windows.exe
+            Bekon-VMS-Desktop-Linux.AppImage
+          )
+          for asset in "${assets[@]}"; do
+            if [[ ! -s "$asset_directory/$asset" || -L "$asset_directory/$asset" ]]; then
+              echo "Missing, empty, or symlinked installer: $asset" >&2
+              exit 1
+            fi
+          done
+          
+          if [[ "$(gh repo view "$public_repo" --json visibility --jq .visibility)" != PUBLIC ]]; then
+            echo "The download repository must be public." >&2
+            exit 1
+          fi
+          
+          (
+            cd "$asset_directory"
+            shasum -a 256 "${assets[@]}" > SHA256SUMS
+          )
+          
+          version="${release_tag#vms-desktop-v}"
+          cat > "$asset_directory/RELEASE-NOTES.md" <<EOF
+          Bekon VMS Desktop $version
+          
+          Download the installer for your operating system:
+          - macOS (Apple silicon and Intel): Bekon-VMS-Desktop-macOS.dmg
+          - Windows (64-bit): Bekon-VMS-Desktop-Windows.exe
+          - Linux (64-bit): Bekon-VMS-Desktop-Linux.AppImage
+          
+          No GitHub account is required. SHA256SUMS contains installer checksums.
+          EOF
+          
+          # Read the tag explicitly so an authentication/network error cannot be mistaken
+          # for a missing release. Only HTTP 404 allows creation of a new draft.
+          release_json="$asset_directory/public-release.json"
+          release_error="$asset_directory/public-release-error.txt"
+          if gh api "repos/$public_repo/releases/tags/$release_tag" > "$release_json" 2> "$release_error"; then
+            if [[ "$(jq -r .draft "$release_json")" != true ]]; then
+              # A retried job can succeed only if the public installers match byte-for-byte.
+              while read -r digest asset; do
+                jq -e --arg name "$asset" --arg digest "sha256:$digest" \
+                  '.assets | any(.name == $name and .digest == $digest)' \
+                  "$release_json" > /dev/null
+              done < "$asset_directory/SHA256SUMS"
+              echo "Public release $release_tag already contains these installers."
+              exit 0
+            fi
+          elif grep -q 'HTTP 404' "$release_error"; then
+            gh release create "$release_tag" --repo "$public_repo" --draft \
+              --title "Bekon VMS Desktop $version" \
+              --notes-file "$asset_directory/RELEASE-NOTES.md"
+          else
+            cat "$release_error" >&2
+            exit 1
+          fi
+          
+          upload_files=()
+          for asset in "${assets[@]}" SHA256SUMS; do
+            upload_files+=("$asset_directory/$asset")
+          done
+          gh release upload "$release_tag" "${upload_files[@]}" --repo "$public_repo" --clobber
+          gh api "repos/$public_repo/releases/tags/$release_tag" > "$release_json"
+          while read -r digest asset; do
+            jq -e --arg name "$asset" --arg digest "sha256:$digest" \
+              '.assets | any(.name == $name and .digest == $digest)' \
+              "$release_json" > /dev/null
+          done < "$asset_directory/SHA256SUMS"
+          
+          # Do not publish unexpected files left over from a manually edited draft.
+          jq -e '[.assets[].name] | sort == (["Bekon-VMS-Desktop-macOS.dmg", "Bekon-VMS-Desktop-Windows.exe", "Bekon-VMS-Desktop-Linux.AppImage", "SHA256SUMS"] | sort)' \
+            "$release_json" > /dev/null
+          gh release edit "$release_tag" --repo "$public_repo" --draft=false --latest \
+            --title "Bekon VMS Desktop $version" \
+            --notes-file "$asset_directory/RELEASE-NOTES.md"
